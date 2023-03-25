@@ -19,7 +19,7 @@ one_process_PID=$!
 sleep 6
 
 # Fountain Code Encoder
-./build/common/fountain_code/encode.py test.txt
+./common/fountain_code/encode.py test.txt
 encoder_PID=$!
 sleep 8
 
@@ -29,7 +29,7 @@ bpsend_PID=$!
 sleep 8
 
 # Fountain Code Decoder
-./build/common/fountain_code/decode.py ./received/encodefile.gz
+./common/fountain_code/decode.py ./received/encodefile.gz
 decoder_PID=$!
 sleep 8
 
