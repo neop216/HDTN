@@ -19,7 +19,7 @@ one_process_PID=$!
 sleep 6
 
 # BP Send File 
-./build/common/bpcodec/apps/bpsendfile  --use-bp-version-7  --max-bundle-size-bytes=4000000 --file-or-folder-path=test.txt --my-uri-eid=ipn:1.1 --dest-uri-eid=ipn:2.1 --outducts-config-file=$gen_config &
+./build/common/bpcodec/apps/bpsendfile  --use-bp-version-7  --max-bundle-size-bytes=1000 --file-or-folder-path=encodefile.gz --my-uri-eid=ipn:1.1 --dest-uri-eid=ipn:2.1 --outducts-config-file=$gen_config &
 bpsend_PID=$!
 sleep 8
 
