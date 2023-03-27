@@ -19,10 +19,8 @@ one_process_PID=$!
 sleep 6
 
 # Fountain Code Encoder
-echo "<encoder> encoding started..."
 ./common/fountain_code/encode.py test.txt -b 1000
 encoder_PID=$!
-echo "<encoder> encoding finished!"
 sleep 8
 
 # BP Send File 
@@ -31,10 +29,8 @@ bpsend_PID=$!
 sleep 8
 
 # Fountain Code Decoder
-echo "<decoder> decoding started..."
 ./common/fountain_code/decode.py ./received/encodefile.gz
 decoder_PID=$!
-echo "<decoder> decoding finished!"
 sleep 8
 
 # cleanup
