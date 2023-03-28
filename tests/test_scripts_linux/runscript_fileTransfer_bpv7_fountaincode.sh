@@ -19,7 +19,7 @@ one_process_PID=$!
 sleep 6
 
 # Fountain Code Encoder
-./common/fountain_code/encode.py test.txt -b 1000
+./common/fountain_code/encode.py test -b 1000 -r 2.0
 encoder_PID=$!
 sleep 8
 

@@ -4,7 +4,6 @@ import os
 import random
 import math
 import numpy as np
-import sys
 import gzip
 import shutil
 import json
@@ -68,16 +67,16 @@ def encode(bundles, original_size, encoded_size):
 
     encoded_data = []
 
-    for i in range(encoded_size):
-        # Randomly choosing a number of xor neighbors, even from a probability distribution, will likely lead to
-        # unsolvable encoding, so to ensure that the encoding is solvable, we start by creating a bundle with one xor
-        # neighbor. In this way, the xor neighbors distribution is slightly less ideal, but it is far more important
-        # that the encoded data is solvable.
-        if i == 0:
-            cur_xor_neighbors = 1
-        else:
-            cur_xor_neighbors = random.choices(xor_possibilities, ideal_dist)[0]
+    # Randomly choosing a number of xor neighbors, even from a probability distribution, will likely lead to
+    # unsolvable encoding, so to ensure that the encoding is solvable, we start by creating a bundle with one xor
+    # neighbor. In this way, the xor neighbors distribution is slightly less ideal, but it is far more important
+    # that the encoded data is solvable.
 
+    xor_neighbors = np.random.choice(xor_possibilities, size=(encoded_size - 1), p=ideal_dist).tolist()
+    # cur_xor_neighbors = np.random.choice(xor_possibilities, size=1, p=ideal_dist).tolist()[0]
+    xor_neighbors.append(1)
+
+    for cur_xor_neighbors in xor_neighbors:
         components = random.sample(range(original_size), cur_xor_neighbors)
 
         cur_encode = bundles[components[0]]
@@ -177,20 +176,14 @@ def main():
     # Write each bundle to the temporary output file. Since HDTN will be fragmenting this encoded file into bundles,
     # we should not write these bundles to the file all at once in a unified data structure like a list.
     # As long as each bundle is surrounded by curly braces {}, the decoder can recover them using regex.
-    with open("temp_encodefile", "wb") as f:
+
+    with gzip.open("encodefile.gz", "wb") as f:
         for bundle in encoded_data:
             # For the purposes of reading these bundles later, we should write them with lists instead of numpy arrays.
             # The lists are converted back into numpy arrays by the decoder.
             bundle["value"] = bundle["value"].tolist()
             to_write = json.dumps(bundle).encode()
             f.write(to_write)
-
-    # Temporary method of data compression. Another method may be more desirable as design constraints are enumerated.
-    # Also, delete the temporary output file after using it since it is not needed.
-    with open("temp_encodefile", "rb") as uncompressed_file:
-        with gzip.open("encodefile.gz", "wb") as compressed_file:
-            shutil.copyfileobj(uncompressed_file, compressed_file)
-    os.remove("temp_encodefile")
 
     print(f"<encoder> writing finished!")
 
