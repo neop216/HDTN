@@ -33,6 +33,6 @@ module/telem_cmd_interface/root/*
 
 *.bin
 
-outfile.*
-encodefile.*
+fountain_code_testfiles/*
+!fountain_code_testfiles/testfiles
 received/*
