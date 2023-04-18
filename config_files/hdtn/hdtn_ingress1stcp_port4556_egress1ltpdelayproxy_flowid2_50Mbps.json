@@ -33,30 +33,34 @@
         "outductConfigName": "myconfig",
         "outductVector": [
             {
-                "name": "stcp_egress",
-                "convergenceLayer": "stcp",
+                "name": "for egress",
+                "convergenceLayer": "ltp_over_udp",
                 "nextHopNodeId": 2,
                 "remoteHostname": "localhost",
-                "remotePort": 4558,
+                "remotePort": 1114,
                 "maxNumberOfBundlesInPipeline": 50,
                 "maxSumOfBundleBytesInPipeline": 50000000,
                 "finalDestinationEidUris": [
                     "ipn:2.*"
                 ],
-                "keepAliveIntervalSeconds": 17
-            },
-            {
-                "name": "stcp_egress",
-                "convergenceLayer": "stcp",
-                "nextHopNodeId": 1,
-                "remoteHostname": "localhost",
-                "remotePort": 4560,
-                "maxNumberOfBundlesInPipeline": 50,
-                "maxSumOfBundleBytesInPipeline": 50000000,
-                "finalDestinationEidUris": [
-                    "ipn:1.*"
-                ],
-                "keepAliveIntervalSeconds": 17
+                "thisLtpEngineId": 20004558,
+                "remoteLtpEngineId": 10004558,
+                "ltpDataSegmentMtu": 60000,
+                "oneWayLightTimeMs": 500,
+                "oneWayMarginTimeMs": 200,
+                "clientServiceId": 1,
+                "numRxCircularBufferElements": 100,
+                "ltpMaxRetriesPerSerialNumber": 3,
+                "ltpCheckpointEveryNthDataSegment": 0,
+                "ltpRandomNumberSizeBits": 64,
+                "ltpSenderBoundPort": 1113,
+                "ltpMaxSendRateBitsPerSecOrZeroToDisable": 50000000,
+                "ltpMaxUdpPacketsToSendPerSystemCall": 1,
+                "ltpSenderPingSecondsOrZeroToDisable": 1,
+                "delaySendingOfDataSegmentsTimeMsOrZeroToDisable": 20,
+                "keepActiveSessionDataOnDisk": false,
+                "activeSessionDataOnDiskNewFileDurationMs": 2000,
+                "activeSessionDataOnDiskDirectory": ".\/"
             }
         ]
     },

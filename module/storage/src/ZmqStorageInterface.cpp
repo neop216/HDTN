@@ -112,7 +112,10 @@ private:
     void SetLinkDown(OutductInfo_t & info);
     void ThreadFunc();
     void SyncTelemetry();
+    void TelemEventsHandler();
     static std::string SprintCustodyidToSizeMap(const custodyid_to_size_map_t& m);
+    void DeleteExpiredBundles();
+    void DeleteBundleById(const uint64_t custodyId);
 
 public:
     StorageTelemetry_t m_telem;
@@ -127,7 +130,6 @@ private:
     std::unique_ptr<zmq::socket_t> m_zmqPushSock_connectingStorageToBoundIngressPtr;
 
     std::unique_ptr<zmq::socket_t> m_zmqRepSock_connectingTelemToFromBoundStoragePtr;
-    std::unique_ptr<zmq::socket_t> m_zmqRepSock_connectingUisToFromBoundStoragePtr;
 
     HdtnConfig m_hdtnConfig;
 
@@ -150,12 +152,21 @@ private:
     volatile bool m_workerThreadStartupInProgress;
     boost::mutex m_workerThreadStartupMutex;
     boost::condition_variable m_workerThreadStartupConditionVariable;
+
+    // For deleting bundles
+    std::vector<uint64_t> m_expiredIds;
+    enum class DeletionPolicy { never, onExpiration, onStorageFull };
+    DeletionPolicy m_deletionPolicy;
+
+    const float DELETE_ALL_EXPIRED_THRESHOLD = 0.9f; /* percent. If storage this full, delete all expired bundles */
+    const uint64_t MAX_DELETE_EXPIRED_PER_ITER = 100; /* Maximum number of bundles to delete per iteration (no storage pressure) */
 };
 
 ZmqStorageInterface::Impl::Impl() :
     m_running(false),
     m_workerThreadStartupInProgress(false),
-    m_hdtnOneProcessZmqInprocContextPtr(nullptr) {}
+    m_hdtnOneProcessZmqInprocContextPtr(nullptr),
+    m_deletionPolicy(DeletionPolicy::never) {}
 
 ZmqStorageInterface::Impl::~Impl() {
     Stop();
@@ -203,6 +214,14 @@ bool ZmqStorageInterface::Impl::Init(const HdtnConfig & hdtnConfig, const HdtnDi
     //HDTN shall default m_myCustodialServiceId to 0 although it is changeable in the hdtn config json file
     M_HDTN_EID_CUSTODY.Set(m_hdtnConfig.m_myNodeId, m_hdtnConfig.m_myCustodialServiceId);
     m_hdtnOneProcessZmqInprocContextPtr = hdtnOneProcessZmqInprocContextPtr;
+
+    if(m_hdtnConfig.m_storageConfig.m_storageDeletionPolicy == "never") {
+        m_deletionPolicy = DeletionPolicy::never;
+    } else if(m_hdtnConfig.m_storageConfig.m_storageDeletionPolicy == "on_expiration") {
+        m_deletionPolicy = DeletionPolicy::onExpiration;
+    } else if(m_hdtnConfig.m_storageConfig.m_storageDeletionPolicy == "on_storage_full") {
+        m_deletionPolicy = DeletionPolicy::onStorageFull;
+    }
 
     //{
 
@@ -300,18 +319,6 @@ bool ZmqStorageInterface::Impl::Init(const HdtnConfig & hdtnConfig, const HdtnDi
     }
     catch (const zmq::error_t& ex) {
         LOG_ERROR(subprocess) << "Cannot subscribe to all events from scheduler: " << ex.what();
-        return false;
-    }
-
-    //uis request
-    m_zmqRepSock_connectingUisToFromBoundStoragePtr = boost::make_unique<zmq::socket_t>(*m_zmqContextPtr, zmq::socket_type::rep);
-    const std::string bind_connectingUisToFromBoundStoragePath("tcp://*:10304");
-    try {
-        m_zmqRepSock_connectingUisToFromBoundStoragePtr->bind(bind_connectingUisToFromBoundStoragePath);// config.releaseWorker);
-        LOG_INFO(subprocess) << "uis sock bound to " << bind_connectingUisToFromBoundStoragePath;
-    }
-    catch (const zmq::error_t& ex) {
-        LOG_ERROR(subprocess) << "error: cannot bind uis socket: " << ex.what();
         return false;
     }
 
@@ -785,6 +792,69 @@ void ZmqStorageInterface::Impl::SyncTelemetry() {
     }
 }
 
+/** Delete bundle from disk
+ *
+ * @param custodyId The custody ID of the bundle to delete
+ */
+void ZmqStorageInterface::Impl::DeleteBundleById(const uint64_t custodyId) {
+    catalog_entry_t *entry = m_bsmPtr->GetCatalogEntryPtrFromCustodyId(custodyId);
+    if(!entry) {
+        LOG_ERROR(subprocess) << "Failed to get catalog entry for " << custodyId << " while deleting for expiry";
+        return;
+    }
+
+    if(entry->HasCustody()) {
+        bool success = m_custodyTimersPtr->CancelCustodyTransferTimer(entry->destEid, custodyId);
+        if(!success) {
+            LOG_ERROR(subprocess) << "Failed to cancel custody timer for " << custodyId << " while deleting for expiry";
+        }
+        //TODO RFC5050 (s5.13) wants us to send a bundle deletion status report to the report-to endpoint
+    }
+
+    m_custodyIdAllocatorPtr->FreeCustodyId(custodyId);
+
+    bool success = m_bsmPtr->RemoveBundleFromDisk(entry, custodyId);
+    if(!success) {
+        LOG_ERROR(subprocess) << "Failed to remove bundle from disk " << custodyId << " while deleting for expiry";
+    }
+}
+
+/** Delete expired bundles
+ *
+ * Deletes expired bundles from disk per storage deletion policy.
+ *
+ * If storage is less full than DELETE_ALL_EXPIRED_THRESHOLD, then at most
+ * MAX_DELETE_EXPIRED_PER_ITER bundles are deleted. Otherwise, all expired
+ * bundles are deleted. (Avoid blocking event loop unless full).
+ *
+ */
+void ZmqStorageInterface::Impl::DeleteExpiredBundles() {
+
+    if(m_deletionPolicy == DeletionPolicy::never) {
+        return;
+    }
+
+    float storageUsagePercentage = m_bsmPtr->GetUsedSpaceBytes()  / (float)m_bsmPtr->GetTotalCapacityBytes();
+
+    if(m_deletionPolicy == DeletionPolicy::onStorageFull && storageUsagePercentage < DELETE_ALL_EXPIRED_THRESHOLD) {
+        return;
+    }
+
+    // If we reach here then either storage is full or policy == "on_expiration"
+
+    uint64_t numToDelete = storageUsagePercentage >= DELETE_ALL_EXPIRED_THRESHOLD ?
+        0 : MAX_DELETE_EXPIRED_PER_ITER;
+
+    uint64_t expiry = TimestampUtil::GetSecondsSinceEpochRfc5050(boost::posix_time::microsec_clock::universal_time());
+
+    m_bsmPtr->GetExpiredBundleIds(expiry, numToDelete, m_expiredIds);
+
+    for(uint64_t custodyId : m_expiredIds) {
+        DeleteBundleById(custodyId);
+        m_telem.m_totalBundlesErasedFromStorageBecauseExpired++;
+    }
+}
+
 void ZmqStorageInterface::Impl::ThreadFunc() {
     ThreadNamer::SetThisThreadName("ZmqStorageInterface");
     
@@ -832,12 +902,11 @@ void ZmqStorageInterface::Impl::ThreadFunc() {
     bool egressFullyInitialized = false;
 
 
-    zmq::pollitem_t pollItems[5] = {
+    zmq::pollitem_t pollItems[4] = {
         {m_zmqPullSock_boundEgressToConnectingStoragePtr->handle(), 0, ZMQ_POLLIN, 0},
         {m_zmqPullSock_boundIngressToConnectingStoragePtr->handle(), 0, ZMQ_POLLIN, 0},
         {m_zmqSubSock_boundReleaseToConnectingStoragePtr->handle(), 0, ZMQ_POLLIN, 0},
         {m_zmqRepSock_connectingTelemToFromBoundStoragePtr->handle(), 0, ZMQ_POLLIN, 0},
-        {m_zmqRepSock_connectingUisToFromBoundStoragePtr->handle(), 0, ZMQ_POLLIN, 0}
     };
     static const long DEFAULT_BIG_TIMEOUT_POLL = 250;
     long timeoutPoll = DEFAULT_BIG_TIMEOUT_POLL; //0 => no blocking
@@ -852,7 +921,7 @@ void ZmqStorageInterface::Impl::ThreadFunc() {
     while (m_running) {
         int rc = 0;
         try {
-            rc = zmq::poll(pollItems, 5, timeoutPoll);
+            rc = zmq::poll(pollItems, 4, timeoutPoll);
         }
         catch (zmq::error_t & e) {
             LOG_ERROR(subprocess) << "caught zmq::error_t in hdtn::ZmqStorageInterface::ThreadFunc: " << e.what();
@@ -874,8 +943,12 @@ void ZmqStorageInterface::Impl::ThreadFunc() {
                         if (egressAckHdr.IsOpportunisticLink()) { //isOpportunisticFromStorage
                             std::map<uint64_t, OutductInfoPtr_t>::iterator it = m_mapOpportunisticNextHopNodeIdToOutductInfo.find(egressAckHdr.nextHopNodeId);
                             if (it == m_mapOpportunisticNextHopNodeIdToOutductInfo.end()) {
-                                LOG_ERROR(subprocess) << "Got an HDTN_MSGTYPE_EGRESS_ACK_TO_STORAGE but could not find opportunistic link nextHopNodeId "
-                                    << egressAckHdr.nextHopNodeId;
+                                static thread_local bool printedMsg = false;
+                                if (!printedMsg) {
+                                    LOG_ERROR(subprocess) << "Got an HDTN_MSGTYPE_EGRESS_ACK_TO_STORAGE but could not find opportunistic link nextHopNodeId "
+                                        << egressAckHdr.nextHopNodeId << ".  (This message type will now be suppressed.)";
+                                    printedMsg = true;
+                                }
                             }
                             else {
                                 outductInfoRawPtr = it->second.get();
@@ -895,12 +968,25 @@ void ZmqStorageInterface::Impl::ThreadFunc() {
                                         //A bundle that was forwarded without store from storage to egress gets an ack back from egress with the
                                         //error flag set because egress could not send the bundle.
                                         //This will allow storage to trigger a link down event more quickly than waiting for scheduler.
-                                        //Since ingress holds the bundle, the error flag will let ingress determine the action for the bundle.
-                                        LOG_WARNING(subprocess) << "Got a link down notification from egress on cut-through path for outduct index "
-                                            << egressAckHdr.outductIndex << " for final dest "
-                                            << egressAckHdr.finalDestEid
-                                            << " because storage forwarding cut-through bundles to egress failed";
-
+                                        //Since ingress NO LONGER holds the bundle, the error flag will let ingress set a link down event more quickly than scheduler.
+                                        //Since isResponseToStorageCutThrough is set, then storage needs the bundle back in a multipart message because storage has not yet written this cut-through bundle to disk.
+                                        static thread_local bool printedMsg = false;
+                                        if (!printedMsg) {
+                                            LOG_WARNING(subprocess) << "Got a link down notification from egress on cut-through path for outduct index "
+                                                << egressAckHdr.outductIndex << " for final dest "
+                                                << egressAckHdr.finalDestEid
+                                                << " because storage forwarding cut-through bundles to egress failed.  (This message type will now be suppressed.)";
+                                            printedMsg = true;
+                                        }
+                                        zmq::message_t zmqBundleDataReceived;
+                                        if (!m_zmqPullSock_boundEgressToConnectingStoragePtr->recv(zmqBundleDataReceived, zmq::recv_flags::none)) {
+                                            LOG_ERROR(subprocess) << "error in hdtn::ZmqStorageInterface::ThreadFunc (from storage cut-through bundle data) message not received";
+                                        }
+                                        else {
+                                            cbhe_eid_t finalDestEidReturnedFromWrite;
+                                            Write(&zmqBundleDataReceived, finalDestEidReturnedFromWrite, true, true); //last true because if cut through then definitely no custody or not admin record
+                                            ++m_telem.m_totalBundlesRewrittenToStorageFromFailedEgressSend;
+                                        }
                                         SetLinkDown(info);
                                         hdtn::StorageAckHdr* storageAckHdr = (hdtn::StorageAckHdr*)it->second.ackToIngress.data();
                                         storageAckHdr->error = 1;
@@ -924,10 +1010,14 @@ void ZmqStorageInterface::Impl::ThreadFunc() {
                                         //This will allow storage to trigger a link down event more quickly than waiting for scheduler.
                                         //Since storage already has the bundle, the error flag will prevent deletion and move the bundle back to the "awaiting send" state,
                                         //but the bundle won't be immediately released again from storage because of the immediate link down event.
-                                        LOG_WARNING(subprocess) << "Got a link down notification from egress for outduct index "
-                                            << egressAckHdr.outductIndex << " for final dest "
-                                            << egressAckHdr.finalDestEid
-                                            << " because storage to egress failed";
+                                        static thread_local bool printedMsg = false;
+                                        if (!printedMsg) {
+                                            LOG_WARNING(subprocess) << "Got a link down notification from egress for outduct index "
+                                                << egressAckHdr.outductIndex << " for final dest "
+                                                << egressAckHdr.finalDestEid
+                                                << " because storage to egress failed.  (This message type will now be suppressed.)";
+                                            printedMsg = true;
+                                        }
 
                                         SetLinkDown(info);
                                         if (!m_bsmPtr->ReturnCustodyIdToAwaitingSend(egressAckHdr.custodyId)) {
@@ -936,6 +1026,7 @@ void ZmqStorageInterface::Impl::ThreadFunc() {
                                         m_custodyTimersPtr->CancelCustodyTransferTimer(egressAckHdr.finalDestEid, egressAckHdr.custodyId);
                                     }
                                     else if (egressAckHdr.deleteNow) { //custody not requested, so don't wait on a custody signal to delete the bundle
+                                        m_custodyIdAllocatorPtr->FreeCustodyId(egressAckHdr.custodyId);
                                         bool successRemoveBundle = m_bsmPtr->RemoveReadBundleFromDisk(egressAckHdr.custodyId);
                                         if (!successRemoveBundle) {
                                             LOG_ERROR(subprocess) << "error freeing bundle from disk";
@@ -949,13 +1040,18 @@ void ZmqStorageInterface::Impl::ThreadFunc() {
                                 }
                                 else {
                                     //std::string message = egressAckHdr.custodyId
-                                    LOG_ERROR(subprocess) << "Storage got a HDTN_MSGTYPE_EGRESS_ACK_TO_STORAGE for outductIndex=" 
-                                        << egressAckHdr.outductIndex << " but could not find custody id " << egressAckHdr.custodyId
-                                        << " .. error=" << (int)egressAckHdr.error 
-                                        << " isResponseToStorageCutThrough=" << (int)egressAckHdr.isResponseToStorageCutThrough
-                                        << " isOpportunisticFromStorage=" << egressAckHdr.IsOpportunisticLink()
-                                        << " nextHopNodeId=" << egressAckHdr.nextHopNodeId;
-                                    LOG_ERROR(subprocess) << SprintCustodyidToSizeMap(mapCustodyIdToSize);
+                                    static thread_local bool printedMsg = false;
+                                    if (!printedMsg) {
+                                        LOG_ERROR(subprocess) << "Storage got a HDTN_MSGTYPE_EGRESS_ACK_TO_STORAGE for outductIndex="
+                                            << egressAckHdr.outductIndex << " but could not find custody id " << egressAckHdr.custodyId
+                                            << " .. error=" << (int)egressAckHdr.error
+                                            << " isResponseToStorageCutThrough=" << (int)egressAckHdr.isResponseToStorageCutThrough
+                                            << " isOpportunisticFromStorage=" << egressAckHdr.IsOpportunisticLink()
+                                            << " nextHopNodeId=" << egressAckHdr.nextHopNodeId
+                                            << ".  (This message type will now be suppressed.)";
+                                        //LOG_DEBUG(subprocess) << SprintCustodyidToSizeMap(mapCustodyIdToSize);
+                                        printedMsg = true;
+                                    }
                                 }
                             }
                         }
@@ -975,8 +1071,13 @@ void ZmqStorageInterface::Impl::ThreadFunc() {
                         ++m_telem.m_totalBundlesRewrittenToStorageFromFailedEgressSend;
                         finalDestEidReturnedFromWrite.serviceId = 0;
                         if (egressFullyInitialized) {
-                            LOG_WARNING(subprocess) << "Storage got a link down notification from egress (with the failed bundle) for final dest "
-                                << Uri::GetIpnUriStringAnyServiceNumber(finalDestEidReturnedFromWrite.nodeId) << " because cut through from ingress failed";
+                            static thread_local bool printedMsg = false;
+                            if (!printedMsg) {
+                                LOG_WARNING(subprocess) << "Storage got a link down notification from egress (with the failed bundle) for final dest "
+                                    << Uri::GetIpnUriStringAnyServiceNumber(finalDestEidReturnedFromWrite.nodeId)
+                                    << " because cut through from ingress failed.  (This message type will now be suppressed.)";
+                                printedMsg = true;
+                            }
                             OutductInfo_t& info = *(m_vectorOutductInfo[egressAckHdr.outductIndex]);
                             SetLinkDown(info);
                         }
@@ -1221,109 +1322,7 @@ void ZmqStorageInterface::Impl::ThreadFunc() {
                 }
             }
             if (pollItems[3].revents & ZMQ_POLLIN) { //telem requests data
-                uint8_t telemMsgByte;
-                const zmq::recv_buffer_result_t res = m_zmqRepSock_connectingTelemToFromBoundStoragePtr->recv(zmq::mutable_buffer(&telemMsgByte, sizeof(telemMsgByte)), zmq::recv_flags::dontwait);
-                if (!res) {
-                    LOG_ERROR(subprocess) << "error in ZmqStorageInterface::ThreadFunc: cannot read telemMsgByte";
-                }
-                else if ((res->truncated()) || (res->size != sizeof(telemMsgByte))) {
-                    LOG_ERROR(subprocess) << "telemMsgByte message mismatch: untruncated = " << res->untruncated_size
-                        << " truncated = " << res->size << " expected = " << sizeof(telemMsgByte);
-                }
-                else if (telemMsgByte == TELEM_REQ_MSG) {                    
-                    //send telemetry
-                    SyncTelemetry();
-                    m_telem.m_timestampMilliseconds = TimestampUtil::GetMillisecondsSinceEpochRfc5050();
-
-                    std::string* storageTelemJsonStringPtr = new std::string(m_telem.ToJson());
-                    std::string& strRef = *storageTelemJsonStringPtr;
-                    zmq::message_t zmqJsonMessage(&strRef[0], storageTelemJsonStringPtr->size(), CustomCleanupStdString, storageTelemJsonStringPtr);
-
-                    if (!m_zmqRepSock_connectingTelemToFromBoundStoragePtr->send(std::move(zmqJsonMessage), zmq::send_flags::dontwait)) {
-                        LOG_ERROR(subprocess) << "can't send json telemetry to telem";
-                    }
-                }
-                /*
-                else if (telemMsgByte == 2) {
-                    //send telemetry
-                    //std::cout << "storage send telem";
-                    StorageExpiringBeforeThresholdTelemetry_t telem;
-                    telem.priority = 2;
-                    telem.thresholdSecondsSinceStartOfYear2000 = TimestampUtil::GetSecondsSinceEpochRfc5050(boost::posix_time::microsec_clock::universal_time() + boost::posix_time::seconds(10000));
-                    if (!bsm.GetStorageExpiringBeforeThresholdTelemetry(telem)) {
-                    }
-                    else {
-                        //send telemetry
-                        std::vector<uint8_t>* vecUint8RawPointer = new std::vector<uint8_t>(1000); //will be 64-bit aligned
-                        uint8_t* telemPtr = vecUint8RawPointer->data();
-                        const uint8_t* const telemSerializationBase = telemPtr;
-                        uint64_t telemBufferSize = vecUint8RawPointer->size();
-
-                        //start zmq message with telemetry
-                        const uint64_t storageTelemSize = telem.SerializeToLittleEndian(telemPtr, telemBufferSize);
-                        telemBufferSize -= storageTelemSize;
-                        telemPtr += storageTelemSize;
-
-                        vecUint8RawPointer->resize(telemPtr - telemSerializationBase);
-
-                        zmq::message_t zmqTelemMessageWithDataStolen(vecUint8RawPointer->data(), vecUint8RawPointer->size(), CustomCleanupStdVecUint8, vecUint8RawPointer);
-                        if (!m_zmqRepSock_connectingTelemToFromBoundStoragePtr->send(std::move(zmqTelemMessageWithDataStolen), zmq::send_flags::dontwait)) {
-                        }
-                    }
-                }
-                */
-                else {
-                    LOG_ERROR(subprocess) << "error telemMsgByte not 1 or 2";
-                }
-            }
-            if (pollItems[4].revents & ZMQ_POLLIN) { //uis requests data
-                StorageTelemetryRequest_t telemReq;
-                const zmq::recv_buffer_result_t res = m_zmqRepSock_connectingUisToFromBoundStoragePtr->recv(zmq::mutable_buffer(&telemReq, sizeof(telemReq)), zmq::recv_flags::dontwait);
-                if (!res) {
-                    LOG_ERROR(subprocess) << "error in ZmqStorageInterface::ThreadFunc: cannot read telemReq";
-                }
-                else if ((res->truncated()) || (res->size != sizeof(telemReq))) {
-                    LOG_ERROR(subprocess) << "telemMsgByte message mismatch: untruncated = " << res->untruncated_size
-                        << " truncated = " << res->size << " expected = " << sizeof(telemReq);
-                }
-                else if (telemReq.type == 10) { //((uint64_t)TelemetryType::storageExpiringBeforeThreshold)) {
-                    //send telemetry
-                    SyncTelemetry();
-                    m_telem.m_timestampMilliseconds = TimestampUtil::GetMillisecondsSinceEpochRfc5050();
-
-                    std::string* storageTelemJsonStringPtr = new std::string(m_telem.ToJson());
-                    std::string& strRef = *storageTelemJsonStringPtr;
-                    zmq::message_t zmqJsonMessage(&strRef[0], storageTelemJsonStringPtr->size(),
-                        CustomCleanupStdString, storageTelemJsonStringPtr);
-
-                    
-
-                    StorageExpiringBeforeThresholdTelemetry_t expiringTelem;
-                    expiringTelem.priority = telemReq.priority;
-                    expiringTelem.thresholdSecondsSinceStartOfYear2000 = TimestampUtil::GetSecondsSinceEpochRfc5050(
-                        boost::posix_time::microsec_clock::universal_time() + boost::posix_time::seconds(telemReq.thresholdSecondsFromNow));
-                    if (!m_bsmPtr->GetStorageExpiringBeforeThresholdTelemetry(expiringTelem)) {
-                        LOG_ERROR(subprocess) << "storage can't get StorageExpiringBeforeThresholdTelemetry";
-                    }
-                    else {
-                        //send telemetry
-                        std::string* expiringTelemJsonStringPtr = new std::string(expiringTelem.ToJson());
-                        std::string& strRefExpiring = *expiringTelemJsonStringPtr;
-                        zmq::message_t zmqExpiringTelemJsonMessage(&strRefExpiring[0],
-                            expiringTelemJsonStringPtr->size(), CustomCleanupStdString, expiringTelemJsonStringPtr);
-
-                        LOG_INFO(subprocess) << "send storage multi-part telem to uis";
-                        if (!m_zmqRepSock_connectingUisToFromBoundStoragePtr->send(std::move(zmqJsonMessage), zmq::send_flags::sndmore | zmq::send_flags::dontwait)) {
-                            LOG_ERROR(subprocess) << "storage can't send json storage telemetry to uis";
-                        }
-                        else if (!m_zmqRepSock_connectingUisToFromBoundStoragePtr->send(std::move(zmqExpiringTelemJsonMessage), zmq::send_flags::dontwait)) {
-                            LOG_ERROR(subprocess) << "storage can't send json StorageExpiringBeforeThresholdTelemetry_t to uis";
-                        }
-                    }
-                }
-                else {
-                    LOG_ERROR(subprocess) << "error telemReq.type not 10";
-                }
+                TelemEventsHandler();
             }
         }
 
@@ -1348,6 +1347,8 @@ void ZmqStorageInterface::Impl::ThreadFunc() {
                 LOG_ERROR(subprocess) << "error unable to return expired custody id " << custodyIdExpiredAndNeedingResent << " to the awaiting send";
             }
         }
+
+        DeleteExpiredBundles();
 
         //For each outduct or opportunistic induct, send to Egress the bundles read from disk or the
         //bundles forwarded over the cut-through path from ingress, alternating/multiplexing between the two.
@@ -1458,6 +1459,77 @@ void ZmqStorageInterface::Impl::ThreadFunc() {
     LOG_DEBUG(subprocess) << "m_totalBundlesErasedFromStorageWithCustodyTransfer: " << m_telem.m_totalBundlesErasedFromStorageWithCustodyTransfer;
     LOG_DEBUG(subprocess) << "numCustodyTransferTimeouts: " << numCustodyTransferTimeouts;
     LOG_DEBUG(subprocess) << "m_totalBundlesRewrittenToStorageFromFailedEgressSend: " << m_telem.m_totalBundlesRewrittenToStorageFromFailedEgressSend;
+}
+
+void ZmqStorageInterface::Impl::TelemEventsHandler() {
+    bool doSendExpiring = false;
+    GetExpiringStorageApiCommand_t getExpiringStorageApiCommand;
+    uint8_t telemMsgByte;
+    const zmq::recv_buffer_result_t res = m_zmqRepSock_connectingTelemToFromBoundStoragePtr->recv(zmq::mutable_buffer(&telemMsgByte, sizeof(telemMsgByte)), zmq::recv_flags::dontwait);
+    if (!res) {
+        LOG_ERROR(subprocess) << "error in ZmqStorageInterface::ThreadFunc: cannot read telemMsgByte";
+        return;
+    }
+    else if ((res->truncated()) || (res->size != sizeof(telemMsgByte))) {
+        LOG_ERROR(subprocess) << "telemMsgByte message mismatch: untruncated = " << res->untruncated_size
+            << " truncated = " << res->size << " expected = " << sizeof(telemMsgByte);
+        return;
+    }
+
+    bool hasApiCalls = telemMsgByte > TELEM_REQ_MSG;
+    if (hasApiCalls) {
+        zmq::message_t apiMsg;
+        do {
+            if (!m_zmqRepSock_connectingTelemToFromBoundStoragePtr->recv(apiMsg, zmq::recv_flags::dontwait)) {
+                LOG_ERROR(subprocess) << "error receiving api message";
+                return;
+            }
+            std::string apiCall = ApiCommand_t::GetApiCallFromJson(apiMsg.to_string());
+            LOG_INFO(subprocess) << "got api call " << apiCall;
+            if (apiCall == "get_expiring_storage") {
+                if (!getExpiringStorageApiCommand.SetValuesFromJson(apiMsg.to_string())) {
+                    return;
+                };
+                doSendExpiring = true;
+            }
+        } while(apiMsg.more());
+    }
+
+    //send normal storage telemetry
+    SyncTelemetry();
+    m_telem.m_timestampMilliseconds = TimestampUtil::GetMillisecondsSinceEpochRfc5050();
+
+    std::string* storageTelemJsonStringPtr = new std::string(m_telem.ToJson());
+    std::string& strRef = *storageTelemJsonStringPtr;
+    zmq::message_t zmqJsonMessage(&strRef[0], storageTelemJsonStringPtr->size(), CustomCleanupStdString, storageTelemJsonStringPtr);
+
+    const zmq::send_flags additionalFlags = (doSendExpiring) ? zmq::send_flags::sndmore : zmq::send_flags::none;
+    if (!m_zmqRepSock_connectingTelemToFromBoundStoragePtr->send(std::move(zmqJsonMessage), zmq::send_flags::dontwait | additionalFlags)) {
+        LOG_ERROR(subprocess) << "can't send json telemetry to telem";
+    }
+
+    if (!doSendExpiring) {
+        return;
+    }
+
+    //send storage expiring telemetry
+    StorageExpiringBeforeThresholdTelemetry_t expiringTelem;
+    expiringTelem.priority = getExpiringStorageApiCommand.m_priority;
+    expiringTelem.thresholdSecondsSinceStartOfYear2000 = TimestampUtil::GetSecondsSinceEpochRfc5050(
+        boost::posix_time::microsec_clock::universal_time() + boost::posix_time::seconds(getExpiringStorageApiCommand.m_thresholdSecondsFromNow));
+    if (!m_bsmPtr->GetStorageExpiringBeforeThresholdTelemetry(expiringTelem)) {
+        LOG_ERROR(subprocess) << "storage can't get StorageExpiringBeforeThresholdTelemetry";
+    }
+    else {
+        std::string* expiringTelemJsonStringPtr = new std::string(expiringTelem.ToJson());
+        std::string& strRefExpiring = *expiringTelemJsonStringPtr;
+        zmq::message_t zmqExpiringTelemJsonMessage(&strRefExpiring[0],
+            expiringTelemJsonStringPtr->size(), CustomCleanupStdString, expiringTelemJsonStringPtr);
+
+        if (!m_zmqRepSock_connectingTelemToFromBoundStoragePtr->send(std::move(zmqExpiringTelemJsonMessage), zmq::send_flags::dontwait)) {
+            LOG_ERROR(subprocess) << "storage can't send json StorageExpiringBeforeThresholdTelemetry_t to telem";
+        }
+    }
 }
 
 std::size_t ZmqStorageInterface::Impl::GetCurrentNumberOfBundlesDeletedFromStorage() {
