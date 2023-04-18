@@ -19,7 +19,7 @@ add_executable(unit-tests
 	../../common/util/test/TestEnumAsFlagsMacro.cpp
 	../../common/util/test/TestPaddedVectorUint8.cpp
 	../../common/util/test/TestFreeListAllocator.cpp
-	$<$<BOOL:${NON_ARM_COMPILATION}>:../../common/util/test/TestCpuFlagDetection.cpp>
+	#$<$<BOOL:${NON_ARM_COMPILATION}>:../../common/util/test/TestCpuFlagDetection.cpp>
 	../../common/util/test/TestTokenRateLimiter.cpp
 	../../common/util/test/TestUdpBatchSender.cpp
 	../../common/util/test/TestJsonSerializable.cpp

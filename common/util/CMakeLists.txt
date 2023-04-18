@@ -8,7 +8,7 @@ add_library(hdtn_util
 	src/TcpAsyncSender.cpp
 	src/Sdnv.cpp
 	src/CborUint.cpp
-	$<$<BOOL:${NON_ARM_COMPILATION}>:src/CpuFlagDetection.cpp>  # only add CpuFlagDetection test to non-ARM builds
+	#$<$<BOOL:${NON_ARM_COMPILATION}>:src/CpuFlagDetection.cpp>  # only add CpuFlagDetection test to non-ARM builds
 	#src/RateManagerAsync.cpp
 	src/Uri.cpp
 	src/BinaryConversions.cpp
