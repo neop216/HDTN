@@ -16,7 +16,6 @@
     "bufferRxToStorageOnLinkUpSaturation": false,
     "maxLtpReceiveUdpPacketSizeBytes": 1500,
     "zmqBoundSchedulerPubSubPortPath": 10200,
-    "zmqBoundTelemApiPortPath": 10305,
     "inductsConfig": {
         "inductConfigName": "myconfig",
         "inductVector": [
@@ -69,7 +68,6 @@
         "tryToRestoreFromDisk": false,
         "autoDeleteFilesOnExit": true,
         "totalStorageCapacityBytes": 8192000000,
-        "storageDeletionPolicy" : "never",
         "storageDiskConfigVector": [
             {
                 "name": "d1",
